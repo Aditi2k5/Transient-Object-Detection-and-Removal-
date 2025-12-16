@@ -1,0 +1,4 @@
+# ninja log v7
+2	17166	7843250953171442	C:/Users/Aditi P/Downloads/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-312/Release/ext.obj	49129be6978d94d3
+30	19761	7843250953456362	C:/Users/Aditi P/Downloads/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-312/Release/simple_knn.obj	fa82778211999683
+60	64965	7843250953746498	C:/Users/Aditi P/Downloads/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-312/Release/spatial.obj	7d296cb56e650dbe

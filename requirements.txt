@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision
+tqdm
+plyfile
+opencv-python
+matplotlib
+numpy
+scipy
+pillow
