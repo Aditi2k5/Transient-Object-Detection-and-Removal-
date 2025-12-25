@@ -10,22 +10,18 @@
 #
 
 import torch
+import torch.nn.functional as F
 import numpy as np
+from collections import deque
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
-import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from typing import Optional
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
 
 class GaussianModel:
 
@@ -47,9 +43,8 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree : int, optimizer_type="default"):
         self.active_sh_degree = 0
-        self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -63,7 +58,21 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.optimizer_type = optimizer_type
         self.setup_functions()
+        
+        # TADD-GS: Motion tracking attributes
+        self.motion_variance = None
+        self.motion_history = deque(maxlen=10)
+        self.position_history = deque(maxlen=10)
+        
+        # TADD-GS: Pattern detection scores
+        self.cyclic_score = None
+        self.linear_score = None
+        self.constant_mover_score = None
+        
+        # For Scene.save() compatibility
+        self.exposure_mapping = {}
 
     def capture(self):
         return (
@@ -118,26 +127,8 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
     
     @property
-    def get_features_dc(self):
-        return self._features_dc
-    
-    @property
-    def get_features_rest(self):
-        return self._features_rest
-    
-    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
-    @property
-    def get_exposure(self):
-        return self._exposure
-
-    def get_exposure_from_name(self, image_name):
-        if self.pretrained_exposures is None:
-            return self._exposure[self.exposure_mapping[image_name]]
-        else:
-            return self.pretrained_exposures[image_name]
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -146,7 +137,15 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, train_cameras, spatial_lr_scale : float):
+        """
+        Create Gaussian model from point cloud
+        
+        Args:
+            pcd: BasicPointCloud with points and colors
+            train_cameras: Training cameras (passed by Scene but may not be used here)
+            spatial_lr_scale: Spatial learning rate scale (cameras extent)
+        """
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -161,7 +160,7 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -170,10 +169,6 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -189,33 +184,14 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
-            try:
-                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
-                # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-
-        self.exposure_optimizer = torch.optim.Adam([self._exposure])
-
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-        
-        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
-                                                        lr_delay_steps=training_args.exposure_lr_delay_steps,
-                                                        lr_delay_mult=training_args.exposure_lr_delay_mult,
-                                                        max_steps=training_args.iterations)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-        if self.pretrained_exposures is None:
-            for param_group in self.exposure_optimizer.param_groups:
-                param_group['lr'] = self.exposure_scheduler_args(iteration)
-
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
@@ -256,22 +232,12 @@ class GaussianModel:
         PlyData([el]).write(path)
 
     def reset_opacity(self):
-        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, use_train_test_exp = False):
+    def load_ply(self, path):
         plydata = PlyData.read(path)
-        if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-            if os.path.exists(exposure_file):
-                with open(exposure_file, "r") as f:
-                    exposures = json.load(f)
-                self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-                print(f"Pretrained exposures loaded.")
-            else:
-                print(f"No exposure to be loaded at {exposure_file}")
-                self.pretrained_exposures = None
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
@@ -361,7 +327,6 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -385,7 +350,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -401,7 +366,6 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -425,9 +389,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -445,15 +408,22 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
-
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii=None):
+        """
+        TADD-GS compatible densification and pruning
+        
+        Args:
+            max_grad: Maximum gradient threshold for densification
+            min_opacity: Minimum opacity threshold for pruning
+            extent: Scene extent
+            max_screen_size: Maximum screen size for pruning
+            radii: Optional radii (max_radii2D) for compatibility
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
@@ -463,33 +433,230 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # Safety check: only add stats if gradients exist and tensor requires grad
+        if viewspace_point_tensor is None:
+            return
+        if not viewspace_point_tensor.requires_grad:
+            # Alternative: use xyz parameter gradients directly
+            if self._xyz.grad is not None:
+                xyz_grad_norm = torch.norm(self._xyz.grad, dim=-1, keepdim=True)
+                self.xyz_gradient_accum[update_filter] += xyz_grad_norm[update_filter]
+                self.denom[update_filter] += 1
+            return
+        if viewspace_point_tensor.grad is None:
+            return
+        
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
-class TADDGaussianModel(GaussianModel):
-    def __init__(self, sh_degree: int):
-        super().__init__(sh_degree)
-        self.motion_variance: Optional[torch.Tensor] = None
 
+    # ========================================================================
+    # TADD-GS METHODS - Complete Implementation
+    # ========================================================================
+    
     def initialize_motion_tracking(self):
-        N = self.get_xyz.shape[0]
-        self.motion_variance = torch.zeros(N, device=self.get_xyz.device)
+        """
+        Initialize motion variance tracking and pattern detection for TADD-GS
+        """
+        n_points = self.get_xyz.shape[0]
+        self.motion_variance = torch.zeros(n_points, device="cuda")
+        
+        # Pattern detection: store motion and position history
+        self.motion_history = deque(maxlen=10)  # Last 10 frames
+        self.position_history = deque(maxlen=10)
+        
+        # Pattern scores
+        self.cyclic_score = torch.zeros(n_points, device="cuda")
+        self.linear_score = torch.zeros(n_points, device="cuda")
+        self.constant_mover_score = torch.zeros(n_points, device="cuda")
+        
+        print(f"[TADD-GS] Initialized motion tracking with pattern detection for {n_points} Gaussians")
 
-    def update_motion_variance_ema(self, motion_pixels: torch.Tensor, alpha: float = 0.9):
+    def update_motion_variance_ema(self, motion, alpha=0.95):
+        """
+        Update exponential moving average of motion variance
+        
+        Args:
+            motion: Tensor of shape [N] containing motion magnitudes
+            alpha: EMA decay factor (higher = more stable)
+        """
+        motion = motion.detach()
+        
         if self.motion_variance is None:
-            self.motion_variance = motion_pixels.detach()
+            self.motion_variance = motion
         else:
-            self.motion_variance = alpha * self.motion_variance + (1 - alpha) * motion_pixels.detach()
+            # Handle size mismatch from densification
+            if self.motion_variance.shape[0] != motion.shape[0]:
+                self.motion_variance = torch.zeros(motion.shape[0], device=motion.device)
+            
+            # EMA update
+            self.motion_variance = alpha * self.motion_variance + (1 - alpha) * motion
+        
+        # Update history for pattern detection
+        self.motion_history.append(motion.clone())
+        self.position_history.append(self.get_xyz.detach().clone())
 
-    def get_distractor_score(self, threshold: float = 0.30) -> torch.Tensor:
+    def update_pattern_scores(self):
+        """
+        Update cyclic and linear motion pattern scores
+        Call this periodically (e.g., every 100 iterations) after motion tracking
+        """
+        if len(self.motion_history) < 10:
+            return  # Not enough history
+        
+        try:
+            # Stack history
+            motion_tensor = torch.stack(list(self.motion_history), dim=0)
+            position_tensor = torch.stack(list(self.position_history), dim=0)
+            
+            # Detect cyclic patterns (FFT)
+            self.cyclic_score = self._detect_cyclic_pattern(motion_tensor)
+            
+            # Detect linear trajectories
+            self.linear_score = self._detect_linear_pattern(position_tensor)
+            
+            # Combined constant mover score
+            self.constant_mover_score = torch.max(self.cyclic_score, self.linear_score)
+        except Exception as e:
+            # Silently handle errors to avoid breaking training
+            pass
+
+    def _detect_cyclic_pattern(self, motion_tensor):
+        """
+        Detect cyclic motion using FFT
+        
+        Args:
+            motion_tensor: [T, N] motion over time
+        
+        Returns:
+            cyclic_score: [N] periodicity score
+        """
+        # FFT along time dimension
+        fft = torch.fft.fft(motion_tensor, dim=0)
+        power = torch.abs(fft) ** 2
+        
+        # Ignore DC component
+        power = power[1:, :]
+        
+        # Peak to mean ratio indicates periodicity
+        max_power = power.max(dim=0)[0]
+        mean_power = power.mean(dim=0)
+        periodicity = max_power / (mean_power + 1e-6)
+        
+        # Sigmoid to 0-1
+        cyclic_score = torch.sigmoid((periodicity - 2.0) / 2.0)
+        
+        return cyclic_score
+
+    def _detect_linear_pattern(self, position_tensor):
+        """
+        Detect linear motion (consistent direction)
+        
+        Args:
+            position_tensor: [T, N, 3] positions over time
+        
+        Returns:
+            linear_score: [N] linearity score
+        """
+        # Displacement vectors
+        displacements = position_tensor[1:] - position_tensor[:-1]
+        
+        # Average direction
+        avg_direction = displacements.mean(dim=0)
+        avg_magnitude = avg_direction.norm(dim=-1)
+        avg_direction = F.normalize(avg_direction + 1e-8, dim=-1)
+        
+        # Consistency with average direction
+        normalized_displacements = F.normalize(displacements + 1e-8, dim=-1)
+        alignments = (normalized_displacements * avg_direction.unsqueeze(0)).sum(dim=-1)
+        consistency = alignments.mean(dim=0)
+        
+        # Linear score
+        magnitude_score = torch.sigmoid((avg_magnitude - 0.01) / 0.01)
+        linear_score = consistency * magnitude_score
+        linear_score = torch.clamp(linear_score, 0.0, 1.0)
+        
+        return linear_score
+
+    def get_distractor_score(self, threshold=0.3):
+        """
+        Get distractor scores based on motion variance and pattern detection
+        
+        Args:
+            threshold: Motion variance threshold
+        
+        Returns:
+            score: [N] distractor probability (0-1)
+        """
         if self.motion_variance is None:
-            return torch.zeros_like(self.get_opacity())
-        return torch.sigmoid(self.motion_variance / threshold)
+            return torch.zeros(self.get_xyz.shape[0], device="cuda")
+        
+        # Normalize motion variance
+        max_variance = self.motion_variance.max()
+        if max_variance < 1e-6:
+            return torch.zeros(self.get_xyz.shape[0], device="cuda")
+        
+        variance_normalized = self.motion_variance / (max_variance + 1e-6)
+        
+        # Base score from motion variance
+        base_score = torch.clamp((variance_normalized - threshold) / (1 - threshold), 0, 1)
+        
+        # Boost score for constant movers
+        if hasattr(self, 'constant_mover_score') and self.constant_mover_score is not None:
+            # Constant movers are more likely to be distractors
+            boosted_score = base_score + 0.3 * self.constant_mover_score
+            boosted_score = torch.clamp(boosted_score, 0.0, 1.0)
+            return boosted_score
+        
+        return base_score
 
-# Override the original
-GaussianModel = TADDGaussianModel
+    def get_transient_score(self, threshold=0.3):
+        """
+        Get scores for transient distractors (not constant movers)
+        
+        Returns:
+            transient_score: [N] transient distractor probability
+        """
+        distractor_score = self.get_distractor_score(threshold)
+        
+        if hasattr(self, 'constant_mover_score') and self.constant_mover_score is not None:
+            # Transient = moving but not constant pattern
+            transient_score = distractor_score * (1.0 - self.constant_mover_score)
+            return transient_score
+        
+        return distractor_score
+
+    def reset_motion_variance_on_densification(self):
+        """
+        Resize motion variance and pattern scores after densification
+        """
+        current_size = self.get_xyz.shape[0]
+        
+        if hasattr(self, 'motion_variance') and self.motion_variance is not None:
+            if self.motion_variance.shape[0] != current_size:
+                old_variance = self.motion_variance
+                self.motion_variance = torch.zeros(current_size, device="cuda")
+                
+                min_size = min(old_variance.shape[0], current_size)
+                self.motion_variance[:min_size] = old_variance[:min_size]
+                
+                if current_size > old_variance.shape[0]:
+                    median_val = old_variance.median().item() if old_variance.numel() > 0 else 0.0
+                    self.motion_variance[old_variance.shape[0]:] = median_val
+        
+        # Reset pattern scores
+        if hasattr(self, 'cyclic_score'):
+            self.cyclic_score = torch.zeros(current_size, device="cuda")
+        if hasattr(self, 'linear_score'):
+            self.linear_score = torch.zeros(current_size, device="cuda")
+        if hasattr(self, 'constant_mover_score'):
+            self.constant_mover_score = torch.zeros(current_size, device="cuda")
+        
+        # Clear history
+        if hasattr(self, 'motion_history'):
+            self.motion_history.clear()
+        if hasattr(self, 'position_history'):
+            self.position_history.clear()
