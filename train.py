@@ -81,7 +81,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, 
-             disable_tadd=False, tadd_warmup=1500, distractor_threshold=0.70, suppression_strength=0.005):
+             disable_tadd=False, tadd_warmup=1500, distractor_threshold=0.50, suppression_strength=0.02):
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
