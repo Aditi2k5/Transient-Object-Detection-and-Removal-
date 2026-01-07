@@ -100,7 +100,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Initialize TADD-GS components
     if not disable_tadd:
         gaussians.initialize_motion_tracking()
-        gaussians.initialize_semantic_tracking()
         print(f"\n{'='*70}")
         print(f"[TADD-GS] ENABLED")
         print(f"{'='*70}")
@@ -183,13 +182,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("\n" + "🔍"*35)
             print("WARMUP JUST ENDED - DIAGNOSING STATE")
             print("🔍"*35)
-
-            try:
-                gaussians.diagnose_hybrid_detection()
-            except Exception as e:
-                print(f"Could not show diagnostics: {e}")
-            
-            print(f"\n{'🔍'*35}\n")
             
             if gaussians.motion_variance is not None:
                 mv = gaussians.motion_variance
@@ -303,24 +295,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % 1000 == 0:
                     print(f"⚠️  Contrastive loss failed: {e}")
 
-
-        semantic_update_freq = 50
-        if not disable_tadd and iteration > motion_tracking_start:
-            if iteration % semantic_update_freq == 0:
-                try:
-                    with torch.no_grad():
-                        # Update semantic scores based on rendered image
-                        gaussians.update_semantic_scores(image, viewpoint_cam)
-                        
-                        # Log occasionally
-                        if iteration % 500 == 0:
-                            num_high_semantic = (gaussians.semantic_scores > 0.6).sum().item()
-                            print(f"[Semantic] Updated at iter {iteration} | High scores: {num_high_semantic}")
-                            
-                except Exception as e:
-                    if iteration % 1000 == 0:
-                        print(f"⚠️  Semantic update: {e}")
-
         # ========================================================================
         # Pattern Detection (every 100 iterations)
         # ========================================================================
@@ -334,37 +308,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ========================================================================
         # GENTLER Distractor Suppression (Less Frequent)
         # ========================================================================
-        # ========== HYBRID SUPPRESSION (UPDATED) ==========
-        if not disable_tadd and iteration % 500 == 0 and iteration > tadd_warmup:
+        if not disable_tadd and iteration % 200 == 0 and iteration > tadd_warmup:  # Every 200, not 50!
             try:
                 with torch.no_grad():
-                    # Get HYBRID distractor scores (motion + semantic)
-                    distractor_scores = gaussians.get_distractor_score_hybrid(
-                        threshold=distractor_threshold
-                    )
-                    
-                    # Very high confidence distractors only
-                    high_confidence = distractor_scores > 0.90
-                    
-                    num_suppress = high_confidence.sum().item()
-                    
-                    if num_suppress > 50:  # At least 50 points
-                        # Gentle opacity suppression
-                        gaussians._opacity[high_confidence] -= suppression_strength
+                    if hasattr(gaussians, "motion_variance") and gaussians.motion_variance is not None:
+                        score = gaussians.get_distractor_score(threshold=distractor_threshold)
+                        very_high_confidence = score > 0.9  # 0.9, not 0.8!
                         
-                        # Clamp to valid range
-                        gaussians._opacity.data = torch.clamp(gaussians._opacity.data, min=0.0)
-                        
-                        if iteration % 2000 == 0:
-                            print(f"\n[Hybrid Suppression] Iter {iteration}")
-                            print(f"  Suppressed: {num_suppress:,} Gaussians")
+                        if very_high_confidence.sum() > 50:  # At least 50 points
+                            opacity_reduction = torch.zeros_like(gaussians._opacity)
+                            opacity_reduction[very_high_confidence] = suppression_strength
+                            gaussians._opacity.data = torch.clamp(
+                                gaussians._opacity.data - opacity_reduction,
+                                min=-5.0, max=5.0
+                            )
                             
-                            # Show diagnostic info
-                            gaussians.diagnose_hybrid_detection()
-                    
+                            if iteration % 1000 == 0:
+                                print(f"[Suppressed {very_high_confidence.sum().item()} distractors]")
+                            
             except Exception as e:
-                if iteration % 1000 == 0:
-                    print(f"⚠️  Suppression: {e}")
+                print(f"⚠️  Suppression failed: {e}")
 
         loss.backward()
         iter_end.record()

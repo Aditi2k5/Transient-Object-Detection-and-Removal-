@@ -22,7 +22,6 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from tadd_gs.semantic_features import SemanticFeatureExtractor, GaussianClusterer
 
 class GaussianModel:
 
@@ -434,21 +433,6 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-        if hasattr(self, 'semantic_scores') and self.semantic_scores is not None:
-            current_size = self.get_xyz.shape[0]
-            score_size = self.semantic_scores.shape[0]
-            
-            if current_size > score_size:
-                # New Gaussians added - give them neutral score
-                new_scores = torch.ones(
-                    current_size - score_size, 
-                    device="cuda"
-                ) * 0.5
-                self.semantic_scores = torch.cat([self.semantic_scores, new_scores])
-                
-            elif current_size < score_size:
-                # Gaussians removed - trim scores
-                self.semantic_scores = self.semantic_scores[:current_size]
 
         torch.cuda.empty_cache()
 
@@ -572,7 +556,6 @@ class GaussianModel:
         Detect linear motion (consistent direction)
         
         Args:
-      
             position_tensor: [T, N, 3] positions over time
         
         Returns:
@@ -677,181 +660,3 @@ class GaussianModel:
             self.motion_history.clear()
         if hasattr(self, 'position_history'):
             self.position_history.clear()
-    def initialize_semantic_tracking(self):
-        """
-        Initialize semantic distractor detection using CLIP.
-        Call this once at the start of training.
-        """
-        print("[TADD-GS] Initializing semantic tracking...")
-        
-        try:
-            from tadd_gs.semantic_features import SemanticFeatureExtractor, GaussianClusterer
-            
-            # Initialize CLIP feature extractor (frozen, no training)
-            self.semantic_extractor = SemanticFeatureExtractor(device="cuda")
-            
-            # Initialize Gaussian clustering for patch creation
-            self.gaussian_clusterer = GaussianClusterer(
-                patch_size=64,      # 64x64 pixel patches
-                min_gaussians=10    # Minimum 10 Gaussians per patch
-            )
-            
-            # Storage for semantic scores per Gaussian
-            # Scores range 0-1, higher = more likely distractor (person)
-            num_gaussians = self.get_xyz.shape[0]
-            self.semantic_scores = torch.ones(num_gaussians, device="cuda") * 0.5  # Start neutral
-            
-            print(f"[TADD-GS] ✅ Semantic tracking initialized")
-            print(f"[TADD-GS]    Gaussians: {num_gaussians:,}")
-            print(f"[TADD-GS]    Patch size: 64x64")
-            print(f"[TADD-GS]    Initial score: 0.5 (neutral)")
-            
-        except Exception as e:
-            print(f"[TADD-GS] ⚠️  Could not initialize semantic tracking: {e}")
-            print(f"[TADD-GS]    Will use motion-only detection")
-            self.semantic_extractor = None
-            self.gaussian_clusterer = None
-            self.semantic_scores = None
-    
-    @torch.no_grad()
-    def update_semantic_scores(self, rendered_image, viewpoint):
-        """
-        Update semantic distractor scores for Gaussians based on current view.
-        
-        Args:
-            rendered_image: [3, H, W] rendered RGB image tensor
-            viewpoint: Current camera viewpoint
-        """
-        # Skip if semantic tracking not initialized
-        if not hasattr(self, 'semantic_extractor') or self.semantic_extractor is None:
-            return
-        
-        try:
-            # 1. Create patches from Gaussians in current view
-            patches, gaussian_indices = self.gaussian_clusterer.create_patches(
-                self, viewpoint
-            )
-            
-            if len(patches) == 0:
-                # No patches created (can happen with small scenes)
-                return
-            
-            # 2. Extract CLIP features for each patch
-            patch_features = self.semantic_extractor.extract_patch_features(
-                rendered_image, patches
-            )
-            
-            # 3. Compute distractor scores for patches
-            patch_scores = self.semantic_extractor.compute_distractor_scores(
-                patch_features
-            )
-            
-            # 4. Update Gaussian scores with EMA (exponential moving average)
-            # This smooths scores over time
-            alpha = 0.1  # 10% new, 90% old (slow update)
-            
-            for patch_score, g_indices in zip(patch_scores, gaussian_indices):
-                score_value = float(patch_score.item())
-                
-                # EMA update: new = alpha * new + (1 - alpha) * old
-                self.semantic_scores[g_indices] = (
-                    alpha * score_value + 
-                    (1 - alpha) * self.semantic_scores[g_indices]
-                )
-            
-        except Exception as e:
-            # Silently fail - don't crash training
-            if not hasattr(self, '_semantic_error_logged'):
-                print(f"[TADD-GS] ⚠️  Semantic update error: {e}")
-                self._semantic_error_logged = True
-    def get_distractor_score_hybrid(self, threshold=0.85):
-        """
-        Hybrid distractor detection: Motion + Semantics
-        
-        Strategy:
-        - High motion + High semantic ("person") = Distractor ✅
-        - High motion + Low semantic ("building") = Parallax (keep) ✅
-        - Low motion + anything = Static (keep) ✅
-        
-        Args:
-            threshold: Threshold for considering as distractor (default: 0.85)
-        
-        Returns:
-            distractor_scores: [N] scores in range [0, 1]
-        """
-        num_gaussians = self.get_xyz.shape[0]
-        
-        # Get motion score (from your existing motion tracking)
-        if self.motion_variance is None:
-            return torch.zeros(num_gaussians, device="cuda")
-        
-        # Normalize motion variance to 0-1 range
-        motion_score = self.motion_variance / (self.motion_variance.max() + 1e-6)
-        
-        # Get semantic score (0-1, higher = more like "person")
-        if not hasattr(self, 'semantic_scores') or self.semantic_scores is None:
-            # Fall back to motion-only if no semantic
-            return motion_score
-        
-        semantic_score = self.semantic_scores
-        
-        # GATED FUSION STRATEGY:
-        # Only apply semantic disambiguation where motion is significant
-        motion_threshold = 0.3  # Only consider if moving
-        
-        # Initialize with zeros
-        hybrid_score = torch.zeros_like(motion_score)
-        
-        # Find Gaussians with significant motion
-        moving = motion_score > motion_threshold
-        
-        # For moving Gaussians, combine motion and semantic
-        # Weight: 50% motion, 50% semantic
-        hybrid_score[moving] = (
-            0.5 * motion_score[moving] +
-            0.5 * semantic_score[moving]
-        )
-        
-        # For static Gaussians, keep score low (don't suppress)
-        # They already have hybrid_score = 0 from initialization
-        
-        return hybrid_score
-    
-    def diagnose_hybrid_detection(self):
-        """
-        Print diagnostic info about hybrid detection.
-        Useful for debugging and understanding what's being detected.
-        """
-        if self.motion_variance is None:
-            print("[Hybrid] Motion tracking not initialized")
-            return
-        
-        motion_norm = self.motion_variance / (self.motion_variance.max() + 1e-6)
-        
-        has_semantic = (hasattr(self, 'semantic_scores') and 
-                       self.semantic_scores is not None)
-        
-        if has_semantic:
-            semantic_norm = self.semantic_scores
-            hybrid_score = self.get_distractor_score_hybrid()
-            
-            print(f"\n[Hybrid Detection Diagnostics]")
-            print(f"  Motion:    min={motion_norm.min():.3f}, max={motion_norm.max():.3f}, mean={motion_norm.mean():.3f}")
-            print(f"  Semantic:  min={semantic_norm.min():.3f}, max={semantic_norm.max():.3f}, mean={semantic_norm.mean():.3f}")
-            print(f"  Hybrid:    min={hybrid_score.min():.3f}, max={hybrid_score.max():.3f}, mean={hybrid_score.mean():.3f}")
-            
-            # Category analysis
-            high_motion = motion_norm > 0.5
-            high_semantic = semantic_norm > 0.5
-            high_hybrid = hybrid_score > 0.7
-            
-            print(f"\n[Category Counts]")
-            print(f"  High motion only:     {(high_motion & ~high_semantic).sum():>6,} (parallax)")
-            print(f"  High semantic only:   {(~high_motion & high_semantic).sum():>6,} (static person)")
-            print(f"  High both:            {(high_motion & high_semantic).sum():>6,} (moving distractor!)")
-            print(f"  High hybrid score:    {high_hybrid.sum():>6,} (will suppress)")
-            
-        else:
-            print(f"\n[Motion-Only Diagnostics]")
-            print(f"  Motion:    min={motion_norm.min():.3f}, max={motion_norm.max():.3f}, mean={motion_norm.mean():.3f}")
-            print(f"  Semantic tracking not initialized (motion-only mode)")
