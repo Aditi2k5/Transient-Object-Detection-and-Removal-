@@ -91,6 +91,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     print(f"Initial Gaussians: {gaussians.get_xyz.shape[0]}")
 
+    with torch.no_grad():
+    # Check scales
+        scales = gaussians.get_scaling()
+        if scales.max() > 10.0 or scales.min() < 0.0001:
+            print(f"⚠️  Invalid scales detected: {scales.min():.6f} - {scales.max():.6f}")
+            print(f"   Clamping to safe range [0.001, 1.0]")
+            gaussians._scaling.data = torch.clamp(gaussians._scaling.data, min=-6.9, max=0.0)
+            scales = gaussians.get_scaling()
+            print(f"   Fixed scales: {scales.min():.6f} - {scales.max():.6f}")
+        
+        # Check rotations
+        rots = gaussians.get_rotation()
+        norms = rots.norm(dim=-1)
+        if (norms - 1.0).abs().max() > 0.1:
+            print(f"⚠️  Invalid rotations detected")
+            print(f"   Normalizing quaternions")
+            gaussians._rotation.data = rots / (norms.unsqueeze(-1) + 1e-8)
+        
+        # Check for NaN/Inf
+        for name, param in [('xyz', gaussians._xyz), ('scaling', gaussians._scaling), 
+                            ('rotation', gaussians._rotation), ('opacity', gaussians._opacity)]:
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"⚠️  NaN/Inf in {name} - fixing")
+                param.data = torch.nan_to_num(param, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        print(f"✅ Gaussian validation complete")
     gaussians.training_setup(opt)
     
     if checkpoint:
