@@ -1,11 +1,10 @@
-# CLIP-GS: Semantic-Guided 3D Gaussian Splatting for Transient Object Removal
+# Semantic-Guided 3D Gaussian Splatting for Transient Object Removal
 
 **A lightweight semantic filtering framework that removes transient objects (people, hands, moving items) from casual multi-view captures in 3D Gaussian Splatting using CLIP-based category-aware scoring and pruning — without motion heuristics or heavy scene decomposition.**
 
 ## 📄 Paper
 
 **arXiv**: [https://arxiv.org/abs/2602.15516](https://arxiv.org/abs/2602.15516)  
-*(Replace with actual arXiv link when available)*
 
 **Abstract** (short): Transient objects cause ghosting artifacts in 3DGS. We propose CLIP-guided semantic filtering that accumulates per-Gaussian distractor scores across training iterations and suppresses them via opacity regularization + periodic pruning. Semantic classification resolves parallax ambiguity better than motion/visibility methods. Experiments on RobustNeRF show consistent gains over vanilla 3DGS while preserving real-time rendering and minimal memory overhead.
 
