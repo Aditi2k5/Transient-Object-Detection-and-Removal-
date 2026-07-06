@@ -29,13 +29,11 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
-    depth_params: dict
+    image: np.array
     image_path: str
     image_name: str
-    depth_path: str
     width: int
     height: int
-    is_test: bool
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -43,7 +41,6 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
-    is_nerf_synthetic: bool
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -68,7 +65,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -85,35 +82,60 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        # Handle different camera models
+        if intr.model == "SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
+            focal_length_y = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
+            
+        elif intr.model == "PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
+            
+        elif intr.model == "SIMPLE_RADIAL":
+            # RobustNeRF uses this!
+            # Params: f, cx, cy, k
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[0]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+            print(f"[Camera {uid}] Using SIMPLE_RADIAL model (f={focal_length_x:.1f})")
+            
+        elif intr.model == "RADIAL":
+            # Params: fx, fy, cx, cy, k1, k2
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+            print(f"[Camera {uid}] Using RADIAL model (fx={focal_length_x:.1f}, fy={focal_length_y:.1f})")
+            
+        elif intr.model in ["OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"]:
+            # Params: fx, fy, cx, cy, k1, k2, p1, p2 (and more for FULL_OPENCV)
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+            print(f"[Camera {uid}] Using {intr.model} model (fx={focal_length_x:.1f}, fy={focal_length_y:.1f})")
+            
         else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+            # Fallback for unknown models
+            print(f"[WARNING] Unknown camera model: {intr.model}")
+            print(f"[WARNING] Using fallback: treating as PINHOLE")
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1] if len(intr.params) > 1 else intr.params[0]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
 
-        n_remove = len(extr.name.split('.')[-1]) + 1
-        depth_params = None
-        if depths_params is not None:
-            try:
-                depth_params = depths_params[extr.name[:-n_remove]]
-            except:
-                print("\n", key, "not found in depths_params")
+        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(extr.name).split(".")[0]
+        image = Image.open(image_path)
 
-        image_path = os.path.join(images_folder, extr.name)
-        image_name = extr.name
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
-
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
-
     sys.stdout.write('\n')
     return cam_infos
 
@@ -142,7 +164,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -154,51 +176,16 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
-    ## if depth_params_file isnt there AND depths file is here -> throw error
-    depths_params = None
-    if depths != "":
-        try:
-            with open(depth_params_file, "r") as f:
-                depths_params = json.load(f)
-            all_scales = np.array([depths_params[key]["scale"] for key in depths_params])
-            if (all_scales > 0).sum():
-                med_scale = np.median(all_scales[all_scales > 0])
-            else:
-                med_scale = 0
-            for key in depths_params:
-                depths_params[key]["med_scale"] = med_scale
-
-        except FileNotFoundError:
-            print(f"Error: depth_params.json file not found at path '{depth_params_file}'.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
-            sys.exit(1)
-
-    if eval:
-        if "360" in path:
-            llffhold = 8
-        if llffhold:
-            print("------------LLFF HOLD-------------")
-            cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
-            cam_names = sorted(cam_names)
-            test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
-        else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
-                test_cam_names_list = [line.strip() for line in file]
-    else:
-        test_cam_names_list = []
-
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(
-        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
-        images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
-    test_cam_infos = [c for c in cam_infos if c.is_test]
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -221,11 +208,10 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=False)
+                           ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -236,15 +222,10 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
-            # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
-
-            # get the world-to-camera transform and set R, T
-            w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
+            matrix = np.linalg.inv(np.array(frame["transform_matrix"]))
+            R = -np.transpose(matrix[:3,:3])
+            R[:,0] = -R[:,0]
+            T = -matrix[:3, 3]
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
@@ -262,21 +243,16 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             FovY = fovy 
             FovX = fovx
 
-            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
-
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
-                            image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"):
-
-    depths_folder=os.path.join(path, depths) if depths != "" else ""
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", depths_folder, white_background, False, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", depths_folder, white_background, True, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
@@ -305,8 +281,7 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=True)
+                           ply_path=ply_path)
     return scene_info
 
 sceneLoadTypeCallbacks = {
