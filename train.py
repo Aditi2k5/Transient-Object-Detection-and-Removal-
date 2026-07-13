@@ -1,11 +1,3 @@
-"""
-3D Gaussian Splatting Training with CLIP Distractor Removal
-Production version with full metrics and checkpointing
-
-Usage:
-    python train.py -s <scene_path> -m <output_path> --enable_clip --iterations 20000 --eval
-"""
-
 import os
 import torch
 from random import randint
