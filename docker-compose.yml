@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    stdin_open: true  # Keeps terminal session interactive
+    tty: true         # Allocates pseudo-TTY
+    volumes:
+      - .:/workspace  # Syncs local code changes live with the container
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
