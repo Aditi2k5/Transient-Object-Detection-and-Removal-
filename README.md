@@ -84,5 +84,5 @@ See **Figure 2** in the paper for visual comparisons on held-out test views.
 
 ---
 
-*This work is currently being extended into real-world applictations*
+*This work is currently being extended into real-world applications*
 **Keywords**: 3D Gaussian Splatting · Transient Object Removal · CLIP · Vision-Language Models · Semantic Filtering · Neural Rendering · Ghosting Artifacts
